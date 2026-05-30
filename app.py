@@ -18,6 +18,7 @@ import soundfile as sf
 import subprocess
 import asyncio
 import edge_tts
+from pypdf import PdfReader
 
 # ─────────────────────────────────────────────────────
 # Page config
@@ -222,7 +223,7 @@ def clean_text(text: str) -> str:
 # ─────────────────────────────────────────────────────
 
 def extract_epub_chapters(epub_path: str) -> list[dict]:
-    """Return list of {title, text} dicts."""
+    """Return list of {title, text} dicts from EPUB file."""
     book = epub.read_epub(epub_path)
     chapters = []
 
@@ -240,6 +241,40 @@ def extract_epub_chapters(epub_path: str) -> list[dict]:
             continue  # skip very short items (ToC, cover, etc.)
         chapters.append({"title": title, "raw_text": raw_text})
 
+    return chapters
+
+
+def extract_pdf_chapters(pdf_path: str) -> list[dict]:
+    """Return list of {title, text} dicts from PDF file.
+    Each page or group of pages becomes a chapter."""
+    reader = PdfReader(pdf_path)
+    chapters = []
+    
+    # Group pages: every 5 pages = 1 chapter (configurable)
+    pages_per_chapter = 5
+    
+    for page_group_idx in range(0, len(reader.pages), pages_per_chapter):
+        start_page = page_group_idx + 1
+        end_page = min(page_group_idx + pages_per_chapter, len(reader.pages))
+        
+        # Extract text from pages in this group
+        text_parts = []
+        for page_idx in range(page_group_idx, end_page):
+            page = reader.pages[page_idx]
+            text = page.extract_text()
+            if text.strip():
+                text_parts.append(text)
+        
+        raw_text = " ".join(text_parts)
+        
+        # Skip very short pages
+        if len(raw_text.strip()) < 80:
+            continue
+        
+        # Create title based on page range
+        title = f"Pages {start_page}–{end_page}"
+        chapters.append({"title": title, "raw_text": raw_text})
+    
     return chapters
 
 
@@ -468,8 +503,8 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### 📂 EPUB File")
-    uploaded = st.file_uploader("Upload EPUB", type=["epub"])
+    st.markdown("### 📂 Document File")
+    uploaded = st.file_uploader("Upload EPUB or PDF", type=["epub", "pdf"])
 
     st.markdown("---")
     st.markdown("### ▶️ Continue from Chapter")
@@ -484,18 +519,27 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────
 # Main area
 # ─────────────────────────────────────────────────────
-st.markdown('<div class="main-header">🎧 EPUB → MP3</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Convert any EPUB audiobook with Supertonic TTS · 128k · chapter-aware</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">🎧 EPUB / PDF → MP3</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Convert any EPUB or PDF document to audiobook with Supertonic TTS · 128k · chapter-aware</div>', unsafe_allow_html=True)
 
 if uploaded:
     # Save to temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+    file_ext = Path(uploaded.name).suffix.lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
         tmp.write(uploaded.read())
-        epub_path = tmp.name
+        doc_path = tmp.name
 
     if st.session_state.epub_name != uploaded.name:
-        with st.spinner("Parsing EPUB…"):
-            raw_chapters = extract_epub_chapters(epub_path)
+        if file_ext == ".epub":
+            with st.spinner("Parsing EPUB…"):
+                raw_chapters = extract_epub_chapters(doc_path)
+        elif file_ext == ".pdf":
+            with st.spinner("Parsing PDF…"):
+                raw_chapters = extract_pdf_chapters(doc_path)
+        else:
+            st.error(f"Unsupported file format: {file_ext}")
+            raw_chapters = []
+        
         st.session_state.chapters = raw_chapters
         st.session_state.epub_name = uploaded.name
         st.session_state.selected_chapter = 0
@@ -509,7 +553,8 @@ if uploaded:
 
         # ── Left: chapter list ──────────────────────────────
         with col_left:
-            st.markdown(f'<div class="card"><b>📖 {uploaded.name}</b><br>'
+            doc_type = "📕" if file_ext == ".pdf" else "📖"
+            st.markdown(f'<div class="card"><b>{doc_type} {uploaded.name}</b><br>'
                         f'<span class="stat-box">{len(chapters)} chapters</span></div>',
                         unsafe_allow_html=True)
 
@@ -567,14 +612,22 @@ if uploaded:
             if engine_choice == "Supertonic TTS":
                 tts = get_tts(model_choice)
             st.markdown(f"**Converting chapter {idx+1}: {ch['title']}**")
+            
+            # Create placeholders for status display
+            status_col, pct_col = st.columns([4, 1])
+            status = status_col.empty()
+            pct_display = pct_col.empty()
             progress = st.progress(0.0)
-            status = st.empty()
+            
             all_wav = []
             sample_rate = 24000  # Default fallback
 
             for fi, frag in enumerate(fragments):
-                status.markdown(f'<div class="progress-msg">Fragment {fi+1}/{len(fragments)}…</div>',
-                                unsafe_allow_html=True)
+                progress_pct = ((fi + 1) / len(fragments)) * 100
+                pct_display.metric("Progress", f"{progress_pct:.1f}%")
+                status.write(f"🎵 Fragment {fi+1}/{len(fragments)}")
+                progress.progress(progress_pct / 100)
+                
                 if engine_choice == "Supertonic TTS":
                     wav = synthesize_fragment(tts, frag, voice_choice, lang_code)
                     sample_rate = tts.sample_rate
@@ -583,12 +636,13 @@ if uploaded:
                         frag, voice_choice, rate_str, volume_str, pitch_str
                     )
                 all_wav.append(wav)
-                progress.progress((fi + 1) / len(fragments))
 
             combined = np.concatenate(all_wav)
             mp3_bytes = wav_to_mp3_bytes(combined, sample_rate, bitrate)
             file_name = make_filename(idx, ch["title"])
-            st.success(f"✅ Done! Chapter {idx+1} converted.")
+            pct_display.metric("Progress", "100%")
+            status.write(f"✅ Done! Chapter {idx+1} converted.")
+            st.success(f"Chapter {idx+1} successfully converted to MP3!")
             st.download_button(
                 f"⬇️ Download {file_name}",
                 data=mp3_bytes,
@@ -602,50 +656,73 @@ if uploaded:
             if engine_choice == "Supertonic TTS":
                 tts = get_tts(model_choice)
             chapters_to_convert = chapters[start_chapter - 1:]
+            
+            # Main progress bar
+            overall_pct = st.empty()
             overall = st.progress(0.0)
-            chapter_status = st.empty()
-            downloads = []
+            
+            st.markdown("### 📥 Downloads (live)")
+            downloads_container = st.container()
 
             for ci, ch_item in enumerate(chapters_to_convert):
                 real_idx = ci + start_chapter - 1
-                chapter_status.markdown(
-                    f'<div class="progress-msg">Chapter {real_idx+1}/{len(chapters)}: {ch_item["title"]}</div>',
-                    unsafe_allow_html=True
-                )
-                clean_ch = clean_text(ch_item["raw_text"])
-                frags = split_into_fragments(clean_ch)
-                frag_progress = st.progress(0.0)
-                all_wav = []
-                sample_rate = 24000  # Fallback
+                overall_progress = ((ci + 1) / len(chapters_to_convert)) * 100
+                
+                overall_pct.metric("Overall Progress", f"{overall_progress:.1f}%")
+                overall.progress(overall_progress / 100)
+                
+                # Create a container for this chapter's details
+                with st.container(border=True):
+                    st.write(f"📖 **Chapter {real_idx+1}/{len(chapters)}: {ch_item['title']}**")
+                    
+                    # Per-chapter progress indicators
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        frag_status = st.empty()
+                    with col2:
+                        frag_pct = st.empty()
+                    
+                    frag_progress = st.progress(0.0)
+                    
+                    clean_ch = clean_text(ch_item["raw_text"])
+                    frags = split_into_fragments(clean_ch)
+                    all_wav = []
+                    sample_rate = 24000  # Fallback
 
-                for fi, frag in enumerate(frags):
-                    if engine_choice == "Supertonic TTS":
-                        wav = synthesize_fragment(tts, frag, voice_choice, lang_code)
-                        sample_rate = tts.sample_rate
-                    else:
-                        wav, sample_rate = synthesize_edge_tts_fragment_sync(
-                            frag, voice_choice, rate_str, volume_str, pitch_str
+                    for fi, frag in enumerate(frags):
+                        frag_progress_pct = ((fi + 1) / len(frags)) * 100
+                        frag_status.write(f"🎵 Fragment {fi+1}/{len(frags)}")
+                        frag_pct.metric("", f"{frag_progress_pct:.0f}%")
+                        frag_progress.progress(frag_progress_pct / 100)
+                        
+                        if engine_choice == "Supertonic TTS":
+                            wav = synthesize_fragment(tts, frag, voice_choice, lang_code)
+                            sample_rate = tts.sample_rate
+                        else:
+                            wav, sample_rate = synthesize_edge_tts_fragment_sync(
+                                frag, voice_choice, rate_str, volume_str, pitch_str
+                            )
+                        all_wav.append(wav)
+
+                    combined = np.concatenate(all_wav)
+                    mp3_bytes = wav_to_mp3_bytes(combined, sample_rate, bitrate)
+                    file_name = make_filename(real_idx, ch_item["title"])
+                    
+                    # Show download button immediately after chapter is done
+                    frag_status.success(f"✅ Chapter {real_idx+1} done!")
+                    frag_progress.progress(1.0)
+                    with downloads_container:
+                        st.download_button(
+                            label=f"⬇️ {file_name}",
+                            data=mp3_bytes,
+                            file_name=file_name,
+                            mime="audio/mpeg",
+                            key=f"dl_{file_name}",
+                            use_container_width=True,
                         )
-                    all_wav.append(wav)
-                    frag_progress.progress((fi + 1) / len(frags))
 
-                combined = np.concatenate(all_wav)
-                mp3_bytes = wav_to_mp3_bytes(combined, sample_rate, bitrate)
-                file_name = make_filename(real_idx, ch_item["title"])
-                downloads.append((file_name, mp3_bytes))
-                overall.progress((ci + 1) / len(chapters_to_convert))
-
-            st.success(f"✅ All {len(downloads)} chapters converted!")
-            st.markdown("### ⬇️ Downloads")
-            for file_name, mp3_bytes in downloads:
-                st.download_button(
-                    label=file_name,
-                    data=mp3_bytes,
-                    file_name=file_name,
-                    mime="audio/mpeg",
-                    key=f"dl_{file_name}",
-                    use_container_width=True,
-                )
+            overall_pct.metric("Overall Progress", "100%")
+            st.success(f"✅ All {len(chapters_to_convert)} chapters converted successfully!")
 
 else:
     # Landing state
@@ -653,10 +730,10 @@ else:
     <div class="card" style="text-align:center; padding: 3rem;">
         <div style="font-size:4rem; margin-bottom:1rem;">📚</div>
         <div style="font-size:1.3rem; font-weight:600; color:rgba(255,255,255,0.9);">
-            Upload an EPUB file to get started
+            Upload an EPUB or PDF file to get started
         </div>
         <div style="color:rgba(255,255,255,0.4); margin-top:0.5rem;">
-            Select your language, voice, and bitrate in the sidebar, then upload your book.
+            Select your language, voice, and bitrate in the sidebar, then upload your document.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -665,9 +742,9 @@ else:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("""<div class="card">
-        <b>📖 Smart Chapter Splitting</b><br><br>
-        Splits at sentence boundaries, never mid-word.
-        Handles chapters larger than 100,000 characters automatically.
+        <b>📄 Multi-Format Support</b><br><br>
+        Supports both EPUB audiobooks and PDF documents.
+        Automatically detects file type and extracts text.
         </div>""", unsafe_allow_html=True)
     with c2:
         st.markdown("""<div class="card">
